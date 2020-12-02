@@ -28,114 +28,140 @@ end
 -- via: https://github.com/kyleconroy/lua-state-machine/
 local machine = dofile(hs.spoons.resourcePath("statemachine.lua"))
 
-watcher = nil
-
-audioStatus = 'off'
-zoomState = machine.create({
-  initial = 'closed',
-  events = {
-    { name = 'start',        from = 'closed',  to = 'running' },
-    { name = 'startMeeting', from = 'running', to = 'meeting' },
-    { name = 'startShare',   from = 'meeting', to = 'sharing' },
-    { name = 'endShare',     from = 'sharing', to = 'meeting' },
-    { name = 'endMeeting',   from = 'meeting', to = 'running' },
-    { name = 'stop',         from = 'running', to = 'closed' },
-  },
-  callbacks = {
-    onstatechange = function(self, event, from, to)
-      changeName = "from-" .. from .. "-to-" .. to
-
-      if changeName == "from-running-to-meeting" then
-        audioStatus = obj:getAudioStatus()
-        obj:_change(audioStatus)
-      elseif changeName == "from-meeting-to-running" then
-        audioStatus = 'off'
-      end
-      obj:_change(changeName)
-    end,
-  }
-})
-
-local endMeetingDebouncer = hs.timer.delayed.new(0.2, function()
-  -- Only end the meeting if the "Meeting" menu is no longer present
-  if not _check({"Meeting", "Invite"}) then
-    zoomState:endMeeting()
-  end
-end)
-
-appWatcher = hs.application.watcher.new(function (appName, eventType, appObject)
-  if (eventType == hs.application.watcher.launched) then
-    zoomState:start()
-
-    watcher = appObject:newWatcher(function (element, event, watcher, userData)
-      local eventName = tostring(event)
-      local windowTitle = ""
-      if element['title'] ~= nil then
-        windowTitle = element:title()
-      end
-
-      if(eventName == "AXTitleChanged" and windowTitle == "Zoom Meeting") then
-        zoomState:startMeeting()
-      elseif(eventName == "AXTitleChanged" and windowTitle == "Zoom Webinar") then
-        zoomState:startMeeting()
-      elseif(eventName == "AXWindowCreated" and windowTitle == "Zoom Meeting") then
-        zoomState:endShare()
-      elseif(eventName == "AXWindowCreated" and windowTitle == "Zoom Webinar") then
-        zoomState:startMeeting()
-      elseif(eventName == "AXWindowCreated" and windowTitle == "Zoom") then
-        zoomState:start()
-      elseif(eventName == "AXWindowCreated" and windowTitle:sub(1, #"zoom share") == "zoom share") then
-        zoomState:startShare()
-      elseif(eventName == "AXUIElementDestroyed") then
-        endMeetingDebouncer:start()
-      end
-    end, { name = "zoom.us" })
-    watcher:start({hs.uielement.watcher.windowCreated, hs.uielement.watcher.titleChanged, hs.uielement.watcher.elementDestroyed})
-  elseif (eventType == hs.application.watcher.terminated) then
-    if (watcher ~= nil) then
-      watcher:stop()
-      if zoomState:is('meeting') then endMeetingDebouncer:start() end
-      zoomState:stop()
-      watcher = nil
+local sysWatcher = hs.application.watcher.new(function (appName, eventType, appObject)
+  if (appObject ~= nil and appObject:title() == "zoom.us") then
+    if (eventType == hs.application.watcher.launched) then
+      hs.printf("watcher detected zoom launch")
+      startZoomWatcher(appObject)
+    elseif (eventType == hs.application.watcher.terminated) then
+      hs.printf("watcher detected zoom terminate")
+      endZoomWatcher()
     end
   end
 end)
 
+local zoomWatcher = nil
+
+local zoomState = machine.create({
+  initial = 'closed',
+  events = {
+    { name = 'start',        from = 'closed',  to = 'running' },
+    { name = 'startMeeting', from = 'running', to = 'meeting' },
+    { name = 'endMeeting',   from = 'meeting', to = 'running' },
+    { name = 'stop',         from = 'meeting', to = 'closed' },
+    { name = 'stop',         from = 'running', to = 'closed' },
+  },
+  callbacks = {
+    onstatechange = function(self, event, from, to)
+      obj:_notifyChange("zoom", from, to)
+    end,
+  }
+})
+
+local micState = machine.create({
+  initial = 'off',
+  events = {
+    { name = 'unmuted',      from = 'off',     to = 'unmuted' },
+    { name = 'unmuted',      from = 'muted',   to = 'unmuted' },
+    { name = 'muted',        from = 'off',     to = 'muted' },
+    { name = 'muted',        from = 'unmuted', to = 'muted' },
+    { name = 'stop',         from = 'muted',   to = 'off' },
+    { name = 'stop',         from = 'unmuted', to = 'off' },
+  },
+  callbacks = {
+    onstatechange = function(self, event, from, to)
+      obj:_notifyChange("mic", from, to)
+    end,
+  }
+})
+
+local checkStatusesDebouncer = hs.timer.delayed.new(1, function()
+  obj:_checkZoomMeetingStatus()
+  obj:_checkMicStatus()
+end)
+
+function startZoomWatcher(appObject)
+  if (zoomWatcher ~= nil) then
+    return
+  end
+
+  zoomWatcher = appObject:newWatcher(function (element, event, watcher, userData)
+    local eventName = tostring(event)
+
+    if(eventName == "AXTitleChanged" or eventName == "AXWindowCreated" or eventName == "AXUIElementDestroyed") then
+      checkStatusesDebouncer:start()
+    end
+  end, { name = "zoom.us" })
+  zoomWatcher:start({
+    hs.uielement.watcher.windowCreated,
+    hs.uielement.watcher.titleChanged,
+    hs.uielement.watcher.elementDestroyed
+  })
+
+  zoomState:start()
+  obj:_checkZoomMeetingStatus()
+  obj:_checkMicStatus()
+end
+
+function endZoomWatcher()
+  if (zoomWatcher ~= nil) then
+    zoomWatcher:stop()
+    zoomState:stop()
+    zoomWatcher = nil
+  end
+end
+
 function obj:start()
-  appWatcher:start()
+  hs.printf("Starting Zoom spoon")
+  local zoomAppAlreadyRunning = hs.application.get("zoom.us")
+  if (zoomAppAlreadyRunning ~= nil) then
+    hs.printf("Zoom app already running, starting watcher")
+    startZoomWatcher(zoomAppAlreadyRunning)
+  end
+  sysWatcher:start()
 end
 
 function obj:stop()
-  appWatcher:stop()
+  sysWatcher:stop()
 end
 
-function _check(tbl)
-  local check = hs.application.get("zoom.us")
-  if (check ~= nil) then
-    return check:findMenuItem(tbl) ~= nil
+function _findZoomMenuItem(tbl)
+  local app = hs.application.get("zoom.us")
+  if (app ~= nil) then
+    return app:findMenuItem(tbl) ~= nil
   end
 end
 
-function obj:_click(tbl)
-  click = hs.application.get("zoom.us")
-  if (click ~= nil) then
-    return click:selectMenuItem(tbl)
+function _selectZoomMenuItem(tbl)
+  local app = hs.application.get("zoom.us")
+  if (app ~= nil) then
+    return app:selectMenuItem(tbl)
   end
 end
 
-function obj:_change(changeEvent)
+function obj:_notifyChange(subject, fromState, toState)
   if (self.callbackFunction) then
-    self.callbackFunction(changeEvent)
+    self.callbackFunction(subject, fromState, toState)
   end
 end
 
-function obj:getAudioStatus()
-  if _check({"Meeting", "Unmute Audio"}) then
-    return 'muted'
-  elseif _check({"Meeting", "Mute Audio"}) then
-    return 'unmuted'
+function obj:_checkZoomMeetingStatus()
+  if _findZoomMenuItem({"Meeting", "Invite"}) then
+    zoomState:startMeeting()
   else
-    return 'off'
+    zoomState:endMeeting()
+  end
+end
+
+function obj:_checkMicStatus()
+  if _findZoomMenuItem({"Meeting", "Unmute Audio"}) then
+    hs.printf("CHECK: MUTED")
+    micState:muted()
+  elseif _findZoomMenuItem({"Meeting", "Mute Audio"}) then
+    hs.printf("CHECK: UNMUTED")
+    micState:unmuted()
+  else
+    micState:stop()
   end
 end
 
@@ -143,11 +169,10 @@ end
 --- Method
 --- Toggles between the 'muted' and 'unmuted states'
 function obj:toggleMute()
-  -- FIXME: Check if reported status differs from expected status, then fix
-  if audioStatus == 'muted' then
+  obj:_checkMicStatus()
+  if micState:is('muted') then
     self:unmute()
-  end
-  if audioStatus == 'unmuted' then
+  elseif micState:is('unmuted') then
     self:mute()
   else
     return nil
@@ -158,9 +183,10 @@ end
 --- Method
 --- Mutes the audio in Zoom, if Zoom is currently unmuted
 function obj:mute()
-  if obj:getAudioStatus() == 'unmuted' and self:_click({"Meeting", "Mute Audio"}) then
-    audioStatus = 'muted'
-    self:_change("muted")
+  self:_checkMicStatus()
+  if micState:is('unmuted') then
+    _selectZoomMenuItem({"Meeting", "Mute Audio"})
+    checkStatusesDebouncer:start()
   end
 end
 
@@ -168,16 +194,16 @@ end
 --- Method
 --- Unmutes the audio in Zoom, if Zoom is currently muted
 function obj:unmute()
-  if obj:getAudioStatus() == 'muted' and self:_click({"Meeting", "Unmute Audio"}) then
-    audioStatus = 'unmuted'
-    self:_change("unmuted")
+  self:_checkMicStatus()
+  if micState:is('muted') then
+    _selectZoomMenuItem({"Meeting", "Unmute Audio"})
+    checkStatusesDebouncer:start()
   end
 end
 
 function obj:inMeeting()
-  return zoomState:is('meeting') or zoomState:is('sharing')
+  return zoomState:is('meeting')
 end
-
 
 --- Zoom:setStatusCallback(func)
 --- Method
